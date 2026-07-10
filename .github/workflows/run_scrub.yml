@@ -1,0 +1,24 @@
+name: Daily Remote Job Scrub
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # Runs automatically every day at 9:00 AM UTC
+  workflow_dispatch: # Allows you to also run it manually with a single click
+
+jobs:
+  run-scrub:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out repo code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-node: '3.10'
+
+    - name: Install dependencies
+      run: pip install requests
+
+    - name: Run Script
+      run: python scraper.py
