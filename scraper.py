@@ -220,15 +220,15 @@ def fetch_remotejobs_org_jobs(keyword: str) -> list[dict]:
             if not posted_at_str:
                 continue
 
-            from dateutil import parser
-posted_at = parser.parse(posted_at_str)
-
-            if not is_within_last_24_hours(posted_at):
-                continue  # this API isn't guaranteed sorted, so just skip, don't stop
-
-            title = job.get("title", "")
-            if title_matches_keyword(title, keyword):
-                company_info = job.get("company", {})
+        from dateutil import parser
+        posted_at = parser.parse(posted_at_str)
+        
+        if not is_within_last_24_hours(posted_at):
+            continue  # this API isn't guaranteed sorted, so just skip, don't stop
+            
+        title = job.get("title", "")
+        if title_matches_keyword(title, keyword):
+            company_info = job.get("company", {})
                 matches.append({
                     "title": title,
                     "company": company_info.get("name", "Unknown company"),
