@@ -313,14 +313,28 @@ def format_jobs_as_text(jobs: list[dict]) -> str:
     ]
 
     for index, job in enumerate(jobs, start=1):
-        posted_str = job["posted_at"].strftime("%Y-%m-%d %H:%M UTC")
-        lines.append(f"{index}. {job['title']}")
-        lines.append(f"   Company: {job['company']}")
-        lines.append(f"   Posted:  {posted_str}")
-        lines.append(f"   Source:  {job['source']}")
-        lines.append(f"   Apply:   {job['url']}")
-        lines.append("")  # blank line between jobs
+     posted_at_str = job.get("posted_at")
+        if not posted_at_str:
+            continue
 
+        from dateutil import parser
+        posted_at = parser.parse(posted_at_str)
+
+        if not is_within_last_24_hours(posted_at):
+            continue  # this API isn't guaranteed sorted, so just skip, don't stop
+
+        title = job.get("title", "")
+        if title_matches_keyword(title, keyword):
+            company_info = job.get("company", {})
+            matches.append(
+                {
+                    "title": title,
+                    "company": company_info.get("name", "Unknown company"),
+                    "url": job.get("apply_url") or job.get("url", ""),
+                    "posted_at": posted_at,
+                    "source": "RemoteJobs.org",
+                }
+            )
     return "\n".join(lines)
 
 
