@@ -1,142 +1,67 @@
-"""
-find_remote_jobs.py
-
-WHAT THIS SCRIPT DOES
-----------------------
-1. Fetches remote job listings from two free, public, no-auth-required JSON APIs:
-     - Himalayas:      https://himalayas.app/jobs/api
-     - RemoteJobs.org:  https://remotejobs.org/api/v1/jobs
-2. Keeps only jobs that were POSTED IN THE LAST 24 HOURS.
-3. Keeps only jobs whose TITLE contains one of our target keywords:
-     "Customer Success", "Client Coordinator", "Content Coordinator",
-     "Influencer Marketing", "UGC"
-4. Prints a clean, readable text block listing the matches (and saves it
-   to a file called job_alerts.txt so GitHub Actions can upload it as an
-   artifact, or you can email/read it later).
-
-WHY IT'S STRUCTURED THIS WAY (for beginners)
----------------------------------------------
-- Both APIs let us pass our own search keyword ("q=...") in the request.
-  We use that to avoid downloading their *entire* job database (which can
-  be 100,000+ jobs). It also means we make far fewer API calls.
-- BUT: their keyword search can match text in the job DESCRIPTION too, not
-  just the title. So after fetching results, we double-check the keyword
-  actually appears in the job TITLE before keeping it. This gives us the
-  "precise keyword in the title" behavior you asked for.
-- We also filter by date ourselves (rather than fully trusting the API),
-  because that's the safest way to guarantee only truly-recent jobs show up.
-
-HOW TO RUN THIS ON GITHUB ACTIONS (every 24 hours)
------------------------------------------------------
-Create a file at .github/workflows/job_alert.yml in your repo with:
-
-    name: Daily Remote Job Alert
-    on:
-      schedule:
-        - cron: "0 13 * * *"   # runs every day at 13:00 UTC - edit as you like
-      workflow_dispatch: {}     # lets you also trigger it manually
-    jobs:
-      run-script:
-        runs-on: ubuntu-latest
-        steps:
-          - uses: actions/checkout@v4
-          - uses: actions/setup-python@v5
-            with:
-              python-version: "3.11"
-          - run: pip install requests
-          - run: python find_remote_jobs.py
-          - uses: actions/upload-artifact@v4
-            with:
-              name: job-alerts
-              path: job_alerts.txt
-
-That's it -- no API keys or secrets needed, since both APIs are free and public.
-"""
-
+import os
+import json
 import time
 from datetime import datetime, timedelta, timezone
-
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
+from dateutil import parser
 
 # ---------------------------------------------------------------------------
-# STEP 0: CONFIGURATION
+# CONFIGURATION
 # ---------------------------------------------------------------------------
+# CHANGE THIS TO YOUR ACTUAL SPREADSHEET ID:
+SPREADSHEET_ID = "/d/1fKcgtPY3gzBAEoLChUdfbNYduHLDGSFd7r3WRHJmlS0/edit"
 
-# The exact phrases we want to match inside a job TITLE.
-# Matching is case-insensitive (e.g. "customer success" also matches
-# "Customer Success Manager").
+# How far back to look for jobs (in hours)
+HOURS_WINDOW = 24
+
+# The precise keywords to match in job titles
 KEYWORDS = [
     "Customer Success",
     "Client Coordinator",
     "Content Coordinator",
     "Influencer Marketing",
-    "UGC",
+    "UGC"
 ]
 
-# Only keep jobs posted within this many hours.
-HOURS_WINDOW = 24
+# Delay between API requests to be polite to servers
+REQUEST_DELAY_SECONDS = 2
 
-# How many result pages to check per keyword, per API, at most.
-# This is a safety cap so the script can't accidentally loop forever or
-# hammer the API with requests. Since we filter to "last 24 hours" and the
-# APIs return newest jobs first, a handful of pages is always more than enough.
-MAX_PAGES_PER_KEYWORD = 3
-
-# Be polite to the free APIs: pause briefly between requests.
-REQUEST_DELAY_SECONDS = 1
-
-# A standard "who is making this request" header. Some APIs like to see this.
-HEADERS = {"User-Agent": "job-alert-script/1.0 (personal automation)"}
-
+# Maximum pages to traverse per keyword query to prevent infinite loops
+MAX_PAGES_PER_KEYWORD = 5
 
 # ---------------------------------------------------------------------------
-# STEP 1: HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # ---------------------------------------------------------------------------
-
-def is_within_last_24_hours(posted_at: datetime) -> bool:
-    """
-    Returns True if `posted_at` (a timezone-aware datetime) falls within the
-    last HOURS_WINDOW hours, compared to right now (UTC).
-    """
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(hours=HOURS_WINDOW)
-    return posted_at >= cutoff
-
+def is_within_last_24_hours(posted_at_dt: datetime) -> bool:
+    """Checks if a datetime object falls within our lookback window."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=HOURS_WINDOW)
+    return posted_at_dt >= cutoff
 
 def title_matches_keyword(title: str, keyword: str) -> bool:
-    """
-    Case-insensitive check that `keyword` appears somewhere in `title`.
-    e.g. title_matches_keyword("Customer Success Manager", "customer success") -> True
-    """
+    """Performs a case-insensitive check to see if keyword is in the title."""
     return keyword.lower() in title.lower()
 
-
 # ---------------------------------------------------------------------------
-# STEP 2: FETCH JOBS FROM HIMALAYAS
+# STEP 1: FETCH FROM HIMALAYAS API
 # ---------------------------------------------------------------------------
-
 def fetch_himalayas_jobs(keyword: str) -> list[dict]:
-    """
-    Queries the Himalayas search endpoint for a single keyword, sorted by
-    most recent first, and returns a list of matching job dicts in our own
-    simplified format:
-        {"title", "company", "url", "posted_at", "source"}
-
-    Docs: https://himalayas.app/docs/remote-jobs-api
-    """
+    """Queries the Himalayas endpoint and returns structured matches."""
     matches = []
-    base_url = "https://himalayas.app/jobs/api/search"
-
+    base_url = "https://himalayas.app"
+    
     for page in range(1, MAX_PAGES_PER_KEYWORD + 1):
         params = {
-            "q": keyword,
-            "sort": "recent",  # newest jobs first, so we can stop early
-            "page": page,
+            "query": keyword,
+            "page": page
         }
-
         try:
-            response = requests.get(base_url, params=params, headers=HEADERS, timeout=15)
-            response.raise_for_status()  # raises an error if the request failed
+            response = requests.get(base_url, params=params, timeout=15)
+            if response.status_code == 404:
+                break
+            response.raise_for_status()
             data = response.json()
         except requests.RequestException as error:
             print(f"  [Himalayas] Request failed for keyword '{keyword}': {error}")
@@ -144,64 +69,55 @@ def fetch_himalayas_jobs(keyword: str) -> list[dict]:
 
         jobs = data.get("jobs", [])
         if not jobs:
-            break  # no more results, stop paginating
-
-        stop_paginating = False
+            break
 
         for job in jobs:
-            # Himalayas gives pubDate as a Unix timestamp in MILLISECONDS.
-            posted_at = datetime.fromtimestamp(job["pubDate"] / 1000, tz=timezone.utc)
+            # Timestamp comes as a Unix integer from Himalayas
+            pub_date_timestamp = job.get("pub_date")
+            if not pub_date_timestamp:
+                continue
+            
+            try:
+                posted_at = datetime.fromtimestamp(int(pub_date_timestamp), tz=timezone.utc)
+            except (ValueError, TypeError):
+                continue
 
             if not is_within_last_24_hours(posted_at):
-                # Since results are sorted newest-first, once we hit a job
-                # older than our window, every job after it will be older
-                # too -- so we can safely stop looking at more pages.
-                stop_paginating = True
+                # Himalayas API is usually sorted newest to oldest.
+                # If we encounter an old job, we can safely stop reading this keyword path.
                 break
 
             title = job.get("title", "")
             if title_matches_keyword(title, keyword):
                 matches.append({
                     "title": title,
-                    "company": job.get("companyName", "Unknown company"),
-                    "url": job.get("applicationLink", ""),
+                    "company": job.get("company", {}).get("name", "Unknown company"),
+                    "url": job.get("application_link") or job.get("link", ""),
                     "posted_at": posted_at,
-                    "source": "Himalayas",
+                    "source": "Himalayas"
                 })
-
-        if stop_paginating:
-            break
-
+        
         time.sleep(REQUEST_DELAY_SECONDS)
-
     return matches
 
-
 # ---------------------------------------------------------------------------
-# STEP 3: FETCH JOBS FROM REMOTEJOBS.ORG
+# STEP 2: FETCH FROM REMOTEJOBS.ORG API
 # ---------------------------------------------------------------------------
-
 def fetch_remotejobs_org_jobs(keyword: str) -> list[dict]:
-    """
-    Queries the RemoteJobs.org endpoint for a single keyword and returns a
-    list of matching job dicts in our own simplified format.
-
-    Docs: https://remotejobs.org/api-access
-    """
+    """Queries the RemoteJobs.org endpoint and returns structured matches."""
     matches = []
-    base_url = "https://remotejobs.org/api/v1/jobs"
-    limit = 50  # max allowed per their docs
-
+    base_url = "https://remotejobs.org"
+    limit = 50
+    
     for page in range(MAX_PAGES_PER_KEYWORD):
         offset = page * limit
         params = {
             "q": keyword,
             "limit": limit,
-            "offset": offset,
+            "offset": offset
         }
-
         try:
-            response = requests.get(base_url, params=params, headers=HEADERS, timeout=15)
+            response = requests.get(base_url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as error:
@@ -213,148 +129,115 @@ def fetch_remotejobs_org_jobs(keyword: str) -> list[dict]:
             break
 
         for job in jobs:
-            # RemoteJobs.org gives posted_at as an ISO 8601 string, e.g.
-            # "2026-04-05T00:00:00Z". Python can parse this once we swap
-            # the trailing "Z" for "+00:00" (which means UTC).
             posted_at_str = job.get("posted_at")
             if not posted_at_str:
                 continue
 
-        from dateutil import parser
-        posted_at = parser.parse(posted_at_str)
-        
-        if not is_within_last_24_hours(posted_at):
-            continue  # this API isn't guaranteed sorted, so just skip, don't stop
-            
-        title = job.get("title", "")
-        if title_matches_keyword(title, keyword):
-            company_info = job.get("company", {})
+            try:
+                posted_at = parser.parse(posted_at_str)
+            except Exception:
+                continue
+
+            if not is_within_last_24_hours(posted_at):
+                continue  # This API isn't guaranteed sorted, so skip it but check the rest
+
+            title = job.get("title", "")
+            if title_matches_keyword(title, keyword):
+                company_info = job.get("company", {})
                 matches.append({
                     "title": title,
                     "company": company_info.get("name", "Unknown company"),
                     "url": job.get("apply_url") or job.get("url", ""),
                     "posted_at": posted_at,
-                    "source": "RemoteJobs.org",
+                    "source": "RemoteJobs.org"
                 })
-
-        # Check if there are more pages worth fetching.
+        
         pagination = data.get("pagination", {})
         if not pagination.get("has_more", False):
             break
-
+            
         time.sleep(REQUEST_DELAY_SECONDS)
-
     return matches
 
-
 # ---------------------------------------------------------------------------
-# STEP 4: PUT IT ALL TOGETHER
+# STEP 3: COMBINE AND DE-DUPLICATE
 # ---------------------------------------------------------------------------
-
 def collect_all_matching_jobs() -> list[dict]:
-    """
-    Loops over every keyword, queries both APIs, and returns one combined,
-    de-duplicated list of matching jobs.
-    """
+    """Runs search over all keywords and returns a de-duplicated combined list."""
     all_jobs = []
-
     for keyword in KEYWORDS:
         print(f"Searching for jobs matching keyword: '{keyword}'...")
+        h_jobs = fetch_himalayas_jobs(keyword)
+        print(f"  Himalayas: {len(h_jobs)} match(es) found")
+        
+        r_jobs = fetch_remotejobs_org_jobs(keyword)
+        print(f"  RemoteJobs.org: {len(r_jobs)} match(es) found")
+        
+        all_jobs.extend(h_jobs)
+        all_jobs.extend(r_jobs)
 
-        himalayas_jobs = fetch_himalayas_jobs(keyword)
-        print(f"  Himalayas: {len(himalayas_jobs)} match(es) found")
-
-        remotejobs_org_jobs = fetch_remotejobs_org_jobs(keyword)
-        print(f"  RemoteJobs.org: {len(remotejobs_org_jobs)} match(es) found")
-
-        all_jobs.extend(himalayas_jobs)
-        all_jobs.extend(remotejobs_org_jobs)
-
-    # De-duplicate: the same job could show up twice if it matches more than
-    # one keyword (e.g. a title containing both "UGC" and "Content Coordinator"),
-    # or if it appears from a query overlap. We treat (title, company, url) as
-    # a unique fingerprint for a job.
-    seen = set()
+    # De-duplicate entries sharing the same URL layout
+    seen_urls = set()
     unique_jobs = []
     for job in all_jobs:
-        fingerprint = (job["title"], job["company"], job["url"])
-        if fingerprint not in seen:
-            seen.add(fingerprint)
+        url = job["url"]
+        if url not in seen_urls:
+            seen_urls.add(url)
             unique_jobs.append(job)
-
-    # Sort newest-first so the most recent postings appear at the top.
-    unique_jobs.sort(key=lambda j: j["posted_at"], reverse=True)
-
+            
     return unique_jobs
 
-
 # ---------------------------------------------------------------------------
-# STEP 5: FORMAT THE RESULTS INTO A NEAT TEXT BLOCK
+# STEP 4: WRITE DATA TO GOOGLE SHEETS
 # ---------------------------------------------------------------------------
+def save_to_google_sheet(jobs: list[dict]):
+    """Connects to Google Sheets using Actions Secret and appends unique items."""
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if not creds_json:
+        print("Error: GOOGLE_CREDENTIALS environment variable is empty.")
+        return
 
-def format_jobs_as_text(jobs: list[dict]) -> str:
-    """
-    Turns a list of job dicts into a readable, plain-text summary block.
-    """
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    try:
+        creds_data = json.loads(creds_json)
+        scope = ["https://googleapis.com"]
+        credentials = Credentials.from_service_account_info(creds_data, scopes=scope)
+        client = gspread.authorize(credentials)
+        
+        sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+    except Exception as e:
+        print(f"Google Sheet authentication or connection failed: {e}")
+        return
 
-    if not jobs:
-        return (
-            f"Remote Job Alert - {now_str}\n"
-            f"{'=' * 60}\n"
-            f"No matching jobs were posted in the last {HOURS_WINDOW} hours.\n"
-        )
+    # Extract existing URLs to prevent duplicating listings inside the document rows
+    existing_urls = set(sheet.col_values(4))  # Assumes URLs live in Column D
 
-    lines = [
-        f"Remote Job Alert - {now_str}",
-        "=" * 60,
-        f"Found {len(jobs)} matching job(s) posted in the last {HOURS_WINDOW} hours:",
-        "",
-    ]
-
-    for index, job in enumerate(jobs, start=1):
-     posted_at_str = job.get("posted_at")
-        if not posted_at_str:
+    new_rows_count = 0
+    for job in jobs:
+        if job["url"] in existing_urls:
             continue
+            
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row_data = [date_str, job["title"], job["company"], job["url"]]
+        sheet.append_row(row_data)
+        new_rows_count += 1
 
-        from dateutil import parser
-        posted_at = parser.parse(posted_at_str)
-
-        if not is_within_last_24_hours(posted_at):
-            continue  # this API isn't guaranteed sorted, so just skip, don't stop
-
-        title = job.get("title", "")
-        if title_matches_keyword(title, keyword):
-            company_info = job.get("company", {})
-            matches.append(
-                {
-                    "title": title,
-                    "company": company_info.get("name", "Unknown company"),
-                    "url": job.get("apply_url") or job.get("url", ""),
-                    "posted_at": posted_at,
-                    "source": "RemoteJobs.org",
-                }
-            )
-    return "\n".join(lines)
-
+    print(f"Successfully appended {new_rows_count} new job tracking rows to Google Sheets.")
 
 # ---------------------------------------------------------------------------
-# STEP 6: MAIN ENTRY POINT
+# MAIN ENTRY POINT
 # ---------------------------------------------------------------------------
-
 def main():
+    if SPREADSHEET_ID == "YOUR_SPREADSHEET_ID_HERE":
+        print("Remember to replace 'YOUR_SPREADSHEET_ID_HERE' with your real Google Spreadsheet ID!")
+        return
+        
     matching_jobs = collect_all_matching_jobs()
-    report = format_jobs_as_text(matching_jobs)
-
-    # Print to the console/GitHub Actions log so you can see it immediately.
-    print("\n" + report)
-
-    # Also save to a text file. In GitHub Actions, you can upload this file
-    # as a workflow artifact (see the docstring at the top of this file),
-    # or extend this script later to email/Slack it to yourself.
-    with open("job_alerts.txt", "w", encoding="utf-8") as f:
-        f.write(report)
-
+    print(f"Found {len(matching_jobs)} total unique matching job postings.")
+    
+    if matching_jobs:
+        save_to_google_sheet(matching_jobs)
+    else:
+        print("No matches discovered within the lookback window today.")
 
 if __name__ == "__main__":
     main()
