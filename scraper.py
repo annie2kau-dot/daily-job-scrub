@@ -220,7 +220,8 @@ def fetch_remotejobs_org_jobs(keyword: str) -> list[dict]:
             if not posted_at_str:
                 continue
 
-            posted_at = datetime.fromisoformat(posted_at_str.replace("Z", "+00:00"))
+            from dateutil import parser
+posted_at = parser.parse(posted_at_str)
 
             if not is_within_last_24_hours(posted_at):
                 continue  # this API isn't guaranteed sorted, so just skip, don't stop
