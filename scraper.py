@@ -10,8 +10,8 @@ from dateutil import parser
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-# CHANGE THIS TO YOUR ACTUAL SPREADSHEET ID:
-SPREADSHEET_ID = "/d/1fKcgtPY3gzBAEoLChUdfbNYduHLDGSFd7r3WRHJmlS0/edit"
+# FIXED: Clean isolated spreadsheet key ID string
+SPREADSHEET_ID = "1fKcgtPY3gzBAEoLChUdfbNYduHLDGSFd7r3WRHJmlS0"
 
 # How far back to look for jobs (in hours)
 HOURS_WINDOW = 24
@@ -36,6 +36,12 @@ MAX_PAGES_PER_KEYWORD = 5
 # ---------------------------------------------------------------------------
 def is_within_last_24_hours(posted_at_dt: datetime) -> bool:
     """Checks if a datetime object falls within our lookback window."""
+    # Ensure posted_at_dt is timezone-aware in UTC to prevent TypeError comparisons
+    if posted_at_dt.tzinfo is None:
+        posted_at_dt = posted_at_dt.replace(tzinfo=timezone.utc)
+    else:
+        posted_at_dt = posted_at_dt.astimezone(timezone.utc)
+        
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=HOURS_WINDOW)
     return posted_at_dt >= cutoff
@@ -72,7 +78,6 @@ def fetch_himalayas_jobs(keyword: str) -> list[dict]:
             break
 
         for job in jobs:
-            # Timestamp comes as a Unix integer from Himalayas
             pub_date_timestamp = job.get("pub_date")
             if not pub_date_timestamp:
                 continue
@@ -83,8 +88,7 @@ def fetch_himalayas_jobs(keyword: str) -> list[dict]:
                 continue
 
             if not is_within_last_24_hours(posted_at):
-                # Himalayas API is usually sorted newest to oldest.
-                # If we encounter an old job, we can safely stop reading this keyword path.
+                # Himalayas is typically sorted newest first; we can halt parsing safely here
                 break
 
             title = job.get("title", "")
@@ -139,7 +143,7 @@ def fetch_remotejobs_org_jobs(keyword: str) -> list[dict]:
                 continue
 
             if not is_within_last_24_hours(posted_at):
-                continue  # This API isn't guaranteed sorted, so skip it but check the rest
+                continue  # Skip entry but continue looking
 
             title = job.get("title", "")
             if title_matches_keyword(title, keyword):
@@ -176,7 +180,6 @@ def collect_all_matching_jobs() -> list[dict]:
         all_jobs.extend(h_jobs)
         all_jobs.extend(r_jobs)
 
-    # De-duplicate entries sharing the same URL layout
     seen_urls = set()
     unique_jobs = []
     for job in all_jobs:
@@ -199,7 +202,11 @@ def save_to_google_sheet(jobs: list[dict]):
 
     try:
         creds_data = json.loads(creds_json)
-        scope = ["https://googleapis.com"]
+        # FIXED: Correct and precise Google API target scopes
+        scope = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
         credentials = Credentials.from_service_account_info(creds_data, scopes=scope)
         client = gspread.authorize(credentials)
         
@@ -208,8 +215,11 @@ def save_to_google_sheet(jobs: list[dict]):
         print(f"Google Sheet authentication or connection failed: {e}")
         return
 
-    # Extract existing URLs to prevent duplicating listings inside the document rows
-    existing_urls = set(sheet.col_values(4))  # Assumes URLs live in Column D
+    # Extract existing URLs from Column D safely to prevent duplicates
+    try:
+        existing_urls = set(sheet.col_values(4))
+    except Exception:
+        existing_urls = set()
 
     new_rows_count = 0
     for job in jobs:
@@ -227,10 +237,6 @@ def save_to_google_sheet(jobs: list[dict]):
 # MAIN ENTRY POINT
 # ---------------------------------------------------------------------------
 def main():
-    if SPREADSHEET_ID == "YOUR_SPREADSHEET_ID_HERE":
-        print("Remember to replace 'YOUR_SPREADSHEET_ID_HERE' with your real Google Spreadsheet ID!")
-        return
-        
     matching_jobs = collect_all_matching_jobs()
     print(f"Found {len(matching_jobs)} total unique matching job postings.")
     
