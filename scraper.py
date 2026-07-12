@@ -14,6 +14,7 @@ SPREADSHEET_ID = "1fKcgtPY3gzBAEoLChUdfbNYduHLDGSFd7r3WRHJmlS0"
 
 HOURS_WINDOW = 24
 
+# The precise phrases to scan for inside job titles
 KEYWORDS = [
     "Customer Success",
     "Client Coordinator",
@@ -22,13 +23,11 @@ KEYWORDS = [
     "UGC"
 ]
 
-REQUEST_DELAY_SECONDS = 1
-
 # ---------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # ---------------------------------------------------------------------------
 def is_within_last_24_hours(posted_at_dt: datetime) -> bool:
-    """Checks if a datetime object falls within our 24-hour lookback window."""
+    """Checks if a datetime object falls within our lookback window."""
     if posted_at_dt.tzinfo is None:
         posted_at_dt = posted_at_dt.replace(tzinfo=timezone.utc)
     else:
@@ -38,128 +37,122 @@ def is_within_last_24_hours(posted_at_dt: datetime) -> bool:
     cutoff = now - timedelta(hours=HOURS_WINDOW)
     return posted_at_dt >= cutoff
 
-def title_matches_keyword(title: str, keyword: str) -> bool:
-    """Performs a case-insensitive check to see if keyword is in the title."""
-    return keyword.lower() in title.lower()
+def title_matches_keyword(title: str) -> bool:
+    """Returns True if ANY of our target tracking keywords are in the job title."""
+    title_clean = title.lower()
+    for kw in KEYWORDS:
+        if kw.lower() in title_clean:
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
-# GLOBAL SCRAPER 1: FINDWORK AGGREGATOR ENGINE (Crawls Company Sites)
+# LIVE SOURCE 1: WORKING NOMADS DIRECT DATA FEED
 # ---------------------------------------------------------------------------
-def fetch_findwork_global(keyword: str) -> list[dict]:
-    """Scrapes the Findwork global index for remote postings across the web."""
+def fetch_working_nomads() -> list[dict]:
+    """Pulls the entire live daily remote feed directly from Working Nomads."""
     matches = []
-    base_url = "https://findwork.dev/api/jobs/"
+    # This feed returns all active postings across the entire web index
+    base_url = "https://www.workingnomads.com/jobs/api/v2/jobs"
     
-    params = {
-        "search": keyword,
-        "remote": "true",
-        "sort": "date"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    
+
     try:
-        # Open global feed API endpoint
-        response = requests.get(base_url, params=params, timeout=15)
-        if response.status_code == 401:
-            print("  [Findwork] Requires an API key header. Skipping to next engine...")
-            return matches
+        response = requests.get(base_url, headers=headers, timeout=20)
         response.raise_for_status()
-        data = response.json()
+        jobs = response.json()
     except Exception as error:
-        print(f"  [Findwork] Index sweep failed: {error}")
+        print(f"  [Working Nomads] Connection skipped or timed out: {error}")
         return matches
 
-    results = data.get("results", [])
-    for job in results:
-        title = job.get("role", "")
-        if not title_matches_keyword(title, keyword):
-            continue
-            
-        date_str = job.get("date_posted")
-        if not date_str:
-            continue
-            
-        try:
-            posted_at = parser.parse(date_str)
-        except Exception:
-            continue
-            
-        if is_within_last_24_hours(posted_at):
-            matches.append({
-                "title": title,
-                "company": job.get("company_name") or "Remote Company",
-                "url": job.get("url") or job.get("source_url", ""),
-                "posted_at": posted_at,
-                "source": "Global Web Aggregator"
-            })
+    if not isinstance(jobs, list):
+        return matches
+
+    print(f"  [Working Nomads] Processing {len(jobs)} total platform listings...")
+    for job in jobs:
+        title = job.get("title", "")
+        if title_matches_keyword(title):
+            date_str = job.get("pub_date") or job.get("created_at")
+            if not date_str:
+                continue
+                
+            try:
+                posted_at = parser.parse(date_str)
+            except Exception:
+                continue
+
+            if is_within_last_24_hours(posted_at):
+                matches.append({
+                    "title": title,
+                    "company": job.get("company_name") or "Remote Company",
+                    "url": job.get("url") or "",
+                    "source": "Working Nomads Network"
+                })
     return matches
 
 # ---------------------------------------------------------------------------
-# GLOBAL SCRAPER 2: THE OPEN REMOTE INDEX (Broad Network Crawl)
+# LIVE SOURCE 2: WE WORK REMOTELY DIRECT FEED
 # ---------------------------------------------------------------------------
-def fetch_open_index_global(keyword: str) -> list[dict]:
-    """Scrapes global job indexes collecting remote postings across web networks."""
+def fetch_we_work_remotely() -> list[dict]:
+    """Pulls the direct daily public tracking stream from We Work Remotely."""
     matches = []
-    base_url = "https://vibrant-remote.workingnomads.com/jobs/api/v2/jobs"
+    # Hits their open public json collection data path directly
+    base_url = "https://weworkremotely.com/api/v1/posts"
     
-    params = {
-        "tags": keyword.replace(" ", "").lower(),
-        "limit": 50
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    
+
     try:
-        response = requests.get(base_url, params=params, timeout=15)
+        response = requests.get(base_url, headers=headers, timeout=20)
         response.raise_for_status()
         data = response.json()
     except Exception as error:
-        print(f"  [Network Engine] Scrape skipped or throttled: {error}")
+        print(f"  [We Work Remotely] Connection skipped or timed out: {error}")
         return matches
 
-    if not isinstance(data, list):
-        return matches
-
-    for job in data:
+    jobs = data.get("posts", [])
+    print(f"  [We Work Remotely] Processing {len(jobs)} total platform listings...")
+    
+    for job in jobs:
         title = job.get("title", "")
-        if not title_matches_keyword(title, keyword):
-            continue
-            
-        date_str = job.get("pub_date") or job.get("created_at")
-        if not date_str:
-            continue
-            
-        try:
-            posted_at = parser.parse(date_str)
-        except Exception:
-            continue
-            
-        if is_within_last_24_hours(posted_at):
-            matches.append({
-                "title": title,
-                "company": job.get("company_name") or job.get("company", "Unknown"),
-                "url": job.get("url") or "",
-                "posted_at": posted_at,
-                "source": "Web Aggregator Network"
-            })
+        if title_matches_keyword(title):
+            date_str = job.get("pub_date")
+            if not date_str:
+                continue
+                
+            try:
+                posted_at = parser.parse(date_str)
+            except Exception:
+                continue
+
+            if is_within_last_24_hours(posted_at):
+                matches.append({
+                    "title": title,
+                    "company": job.get("company") or "Remote Company",
+                    "url": job.get("url") or "",
+                    "source": "We Work Remotely"
+                })
     return matches
 
 # ---------------------------------------------------------------------------
 # CORE PROCESSOR
 # ---------------------------------------------------------------------------
 def collect_all_matching_jobs() -> list[dict]:
-    """Runs global sweeps across multiple networks for all requested target fields."""
+    """Sweeps whole target raw feeds instantly to circumvent IP proxy block limits."""
     all_jobs = []
-    for keyword in KEYWORDS:
-        print(f"Sweeping global listings for tracking keyword: '{keyword}'...")
-        
-        engine_1 = fetch_findwork_global(keyword)
-        print(f"  Engine A found: {len(engine_1)} direct matches.")
-        
-        engine_2 = fetch_open_index_global(keyword)
-        print(f"  Engine B found: {len(engine_2)} network matches.")
-        
-        all_jobs.extend(engine_1)
-        all_jobs.extend(engine_2)
-        time.sleep(REQUEST_DELAY_SECONDS)
+    
+    print("Beginning comprehensive direct web source scan...")
+    wn_jobs = fetch_working_nomads()
+    print(f"  -> Working Nomads filtered: {len(wn_jobs)} match(es)")
+    all_jobs.extend(wn_jobs)
+    
+    wwr_jobs = fetch_we_work_remotely()
+    print(f"  -> We Work Remotely filtered: {len(wwr_jobs)} match(es)")
+    all_jobs.extend(wwr_jobs)
 
+    # De-duplicate items sharing identical destinations
     seen_urls = set()
     unique_jobs = []
     for job in all_jobs:
@@ -171,13 +164,13 @@ def collect_all_matching_jobs() -> list[dict]:
     return unique_jobs
 
 # ---------------------------------------------------------------------------
-# SHEET EXPORT INTEGRATION
+# GOOGLE SPREADSHEET EXPORT EXECUTOR
 # ---------------------------------------------------------------------------
 def save_to_google_sheet(jobs: list[dict]):
-    """Connects to Google Sheets using the repository Actions Secret token data."""
+    """Connects to Google Sheets and appends unique items to rows safely."""
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_json:
-        print("Error: GOOGLE_CREDENTIALS environment secret configuration is missing.")
+        print("Error: GOOGLE_CREDENTIALS environment variable is empty.")
         return
 
     try:
@@ -191,7 +184,7 @@ def save_to_google_sheet(jobs: list[dict]):
         
         sheet = client.open_by_key(SPREADSHEET_ID).sheet1
     except Exception as e:
-        print(f"Google Workspace auth handshake rejected: {e}")
+        print(f"Google Sheet connection handshake failed: {e}")
         return
 
     try:
@@ -209,16 +202,16 @@ def save_to_google_sheet(jobs: list[dict]):
         sheet.append_row(row_data)
         new_rows_count += 1
 
-    print(f"Successfully pushed {new_rows_count} verified matching job listings to Google Sheets.")
+    print(f"Successfully appended {new_rows_count} new job tracking rows to Google Sheets.")
 
 def main():
     matching_jobs = collect_all_matching_jobs()
-    print(f"Completed run. Discovered {len(matching_jobs)} unique listings across all vectors.")
+    print(f"Found {len(matching_jobs)} total unique matching job postings.")
     
     if matching_jobs:
         save_to_google_sheet(matching_jobs)
     else:
-        print("No matches popped up on the live web filters over the last 24 hours.")
+        print("No matches discovered within the lookback window today.")
 
 if __name__ == "__main__":
     main()
